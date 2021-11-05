@@ -85,6 +85,7 @@ func main() {
 
 	app := fiber.New(fiber.Config{
 		ErrorHandler: func(ctx *fiber.Ctx, err error) error {
+			ctx.Set("X-Error", err.Error())
 			return ctx.Status(500).SendString("短连接服务异常")
 		},
 		ServerHeader:  "",
@@ -151,8 +152,14 @@ func main() {
 			//Storage:      storage,
 		}),
 		func(ctx *fiber.Ctx) error {
+			token := ctx.Params("hash")
+			if len(token) != 12 {
+				ctx.Status(400)
+				return ctx.SendString("not found url")
+			}
+
 			var short ShortMap
-			err = db.Where("token = ?", ctx.Params("hash")).First(&short).Error
+			err = db.Where("token = ?", token).First(&short).Error
 			if err != nil {
 				if err == gorm.ErrRecordNotFound {
 					ctx.Status(400)
@@ -167,7 +174,7 @@ func main() {
 
 	app.Post("/short", func(ctx *fiber.Ctx) error {
 		var req struct {
-			Url string `json:"url" yaml:"url"`
+			Url string `json:"longUrl" yaml:"longUrl"`
 		}
 
 		var rsp struct {
@@ -177,10 +184,14 @@ func main() {
 			ShortUrl string `json:"ShortUrl"`
 		}
 
-		err = ctx.BodyParser(&req)
-		if err != nil {
-			log.Errorf("err:%v", err)
-			return err
+		if ctx.FormValue("longUrl") != "" {
+			req.Url = ctx.FormValue("longUrl")
+		} else {
+			err = ctx.BodyParser(&req)
+			if err != nil {
+				log.Errorf("err:%v", err)
+				return err
+			}
 		}
 
 		if req.Url == "" {
@@ -193,7 +204,7 @@ func main() {
 				rsp.Message = "url not base64"
 			} else {
 				short := ShortMap{
-					Token:   utils.ShortStr(utils.Sha512(string(u)), 10),
+					Token:   utils.ShortStr(utils.Sha512(req.Url), 12),
 					JumpUrl: string(u),
 				}
 				err = db.Where("token = ?", short.Token).FirstOrCreate(&short).Error
@@ -204,10 +215,12 @@ func main() {
 
 				rsp.Code = 0
 				rsp.ShortUrl = ctx.BaseURL() + "/" + short.Token
+				rsp.LongUrl = req.Url
 			}
 		}
 
-		return ctx.JSONP(rsp)
+		ctx.Status(200)
+		return ctx.JSON(rsp)
 	})
 
 	err = app.Listen(viper.GetString("host"))
