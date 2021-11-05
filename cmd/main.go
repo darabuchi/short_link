@@ -152,7 +152,6 @@ func main() {
 	)
 
 	app.Get("/:hash", func(ctx *fiber.Ctx) error {
-		log.Info(ctx.Params("hash"))
 		var short ShortMap
 		err = db.Where("token = ?", ctx.Params("hash")).First(&short).Error
 		if err != nil {
@@ -205,7 +204,7 @@ func main() {
 				}
 
 				rsp.Code = 0
-				rsp.ShortUrl = short.Token
+				rsp.ShortUrl = ctx.BaseURL() + "/" + short.Token
 			}
 		}
 
