@@ -19,7 +19,6 @@ import (
 	"gorm.io/gorm/schema"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -123,15 +122,6 @@ func main() {
 			AllowCredentials: false,
 			ExposeHeaders:    "*",
 		}),
-		cache.New(cache.Config{
-			Next: func(c *fiber.Ctx) bool {
-				refresh := c.Query("refresh")
-				return refresh == "1" || strings.ToLower(refresh) == "true"
-			},
-			Expiration:   time.Minute * 5,
-			CacheControl: true,
-			//Storage:      storage,
-		}),
 		compress.New(compress.Config{
 			Level: compress.LevelBestCompression,
 		}),
@@ -151,20 +141,29 @@ func main() {
 		},
 	)
 
-	app.Get("/:hash", func(ctx *fiber.Ctx) error {
-		var short ShortMap
-		err = db.Where("token = ?", ctx.Params("hash")).First(&short).Error
-		if err != nil {
-			if err == gorm.ErrRecordNotFound {
-				ctx.Status(400)
-				return ctx.SendString("not found url")
+	app.Get("/:hash",
+		cache.New(cache.Config{
+			Expiration:   time.Minute * 5,
+			CacheControl: true,
+			KeyGenerator: func(ctx *fiber.Ctx) string {
+				return ctx.OriginalURL()
+			},
+			//Storage:      storage,
+		}),
+		func(ctx *fiber.Ctx) error {
+			var short ShortMap
+			err = db.Where("token = ?", ctx.Params("hash")).First(&short).Error
+			if err != nil {
+				if err == gorm.ErrRecordNotFound {
+					ctx.Status(400)
+					return ctx.SendString("not found url")
+				}
+				log.Errorf("err:%v", err)
+				return err
 			}
-			log.Errorf("err:%v", err)
-			return err
-		}
 
-		return ctx.Redirect(short.JumpUrl, 301)
-	})
+			return ctx.Redirect(short.JumpUrl, 301)
+		})
 
 	app.Post("/short", func(ctx *fiber.Ctx) error {
 		var req struct {
