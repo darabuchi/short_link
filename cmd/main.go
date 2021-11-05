@@ -213,7 +213,7 @@ func main() {
 					return err
 				}
 
-				rsp.Code = 0
+				rsp.Code = 1
 				rsp.ShortUrl = ctx.BaseURL() + "/" + short.Token
 				rsp.LongUrl = req.Url
 			}
