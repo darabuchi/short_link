@@ -1,15 +1,18 @@
 package main
 
 import (
+	"embed"
 	"encoding/base64"
 	"fmt"
 	nested "github.com/antonfisher/nested-logrus-formatter"
+	"github.com/bluele/gcache"
+	utils2 "github.com/darabuchi/enputi/utils"
 	"github.com/darabuchi/utils"
 	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/cache"
 	"github.com/gofiber/fiber/v2/middleware/compress"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/recover"
+	"github.com/gofiber/template/django"
 	"github.com/pterm/pterm"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
@@ -17,10 +20,32 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/schema"
+	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"time"
 )
+
+const (
+	Title = "Darabuchi-Short Link"
+)
+
+var (
+	//go:embed views
+	drive embed.FS
+
+	cache = gcache.New(1024 * 8).LRU().Build()
+)
+
+func getFileSystem(base string) http.FileSystem {
+	fsys, err := fs.Sub(drive, base)
+	if err != nil {
+		panic(err)
+	}
+
+	return http.FS(fsys)
+}
 
 func main() {
 	// 可能存在的目录
@@ -102,6 +127,7 @@ func main() {
 		BodyLimit:                -1,
 		ReadBufferSize:           1024 * 1024 * 4,
 		WriteBufferSize:          1024 * 1024 * 4,
+		Views:                    django.NewFileSystem(getFileSystem("views"), ".html"),
 	})
 	app.Server().Logger = log.New()
 
@@ -110,10 +136,27 @@ func main() {
 	}
 
 	app.Use(
-		func(ctx *fiber.Ctx) error {
+		func(c *fiber.Ctx) error {
 			start := time.Now()
-			err := ctx.Next()
-			ctx.Set("X-Handle-Time", time.Since(start).String())
+			defer c.Set("X-Time", time.Since(start).String())
+			reqId := c.Context().ID()
+			msg := fmt.Sprintf("<%v>[%s]%s %v %s %s",
+				reqId, utils2.GetRealIpFromCtx(c), c.Method(), c.Path(),
+				utils.ShortStr4Web(c.Request().Header.String(), -1),
+				utils.ShortStr4Web(string(c.Body()), 400))
+			log.Info(msg)
+
+			err := c.Next()
+
+			msg = fmt.Sprintf("<%v>%d %s",
+				reqId, c.Response().StatusCode(),
+				utils.ShortStr4Web(string(c.Response().Body()), 400))
+			if err != nil {
+				msg += fmt.Sprintf(" err:%v", err)
+				log.Error(msg)
+			} else {
+				log.Info(msg)
+			}
 			return err
 		},
 		cors.New(cors.Config{
@@ -142,15 +185,20 @@ func main() {
 		},
 	)
 
+	app.Get("/", func(ctx *fiber.Ctx) error {
+		//return ctx.SendString("OK")
+		return ctx.Render("index", fiber.Map{
+			"Title": Title,
+		})
+	})
+
 	app.Get("/:hash",
-		cache.New(cache.Config{
-			Expiration:   time.Minute * 5,
-			CacheControl: true,
-			KeyGenerator: func(ctx *fiber.Ctx) string {
-				return ctx.OriginalURL()
-			},
-			//Storage:      storage,
-		}),
+		//cache.New(cache.Config{
+		//	Expiration: time.Minute * 5,
+		//	KeyGenerator: func(ctx *fiber.Ctx) string {
+		//		return ctx.Params("hash")
+		//	},
+		//}),
 		func(ctx *fiber.Ctx) error {
 			token := ctx.Params("hash")
 			if len(token) != 12 {
@@ -158,18 +206,37 @@ func main() {
 				return ctx.SendString("not found url")
 			}
 
-			var short ShortMap
-			err = db.Where("token = ?", token).First(&short).Error
-			if err != nil {
-				if err == gorm.ErrRecordNotFound {
-					ctx.Status(400)
-					return ctx.SendString("not found url")
+			ctx.Vary("Origin", "User-Agent", "Origin", "Accept-Encoding", "Accept")
+
+			var jumpUrl string
+			val, err := cache.Get(token)
+			if err == nil {
+				jumpUrl = val.(string)
+			} else {
+				var short ShortMap
+				err = db.Where("token = ?", token).First(&short).Error
+				if err != nil {
+					if err == gorm.ErrRecordNotFound {
+						ctx.Status(400)
+						return ctx.SendString("not found url")
+					}
+					log.Errorf("err:%v", err)
+					return err
 				}
-				log.Errorf("err:%v", err)
-				return err
+
+				u, err := base64.StdEncoding.DecodeString(short.JumpUrl)
+				if err != nil {
+					log.Errorf("err:%v", err)
+					return err
+				}
+
+				jumpUrl = string(u)
 			}
 
-			return ctx.Redirect(short.JumpUrl, 301)
+			log.Info(jumpUrl)
+			ctx.Location(jumpUrl)
+			ctx.Context().Redirect(jumpUrl, 307)
+			return ctx.SendString("")
 		})
 
 	app.Post("/short", func(ctx *fiber.Ctx) error {
@@ -194,6 +261,8 @@ func main() {
 			}
 		}
 
+		log.Info(req.Url)
+
 		if req.Url == "" {
 			rsp.Code = -1
 			rsp.Message = "miss url"
@@ -205,12 +274,21 @@ func main() {
 			} else {
 				short := ShortMap{
 					Token:   utils.ShortStr(utils.Sha512(req.Url), 12),
-					JumpUrl: string(u),
+					JumpUrl: req.Url,
 				}
+				log.Info(string(u))
 				err = db.Where("token = ?", short.Token).FirstOrCreate(&short).Error
 				if err != nil {
 					log.Errorf("err:%v", err)
 					return err
+				}
+
+				if short.JumpUrl != string(u) {
+					err = db.Model(&short).Where("token = ?", short.Token).Update("jump_url", req.Url).Error
+					if err != nil {
+						log.Errorf("err:%v", err)
+						return err
+					}
 				}
 
 				rsp.Code = 1
@@ -221,6 +299,39 @@ func main() {
 
 		ctx.Status(200)
 		return ctx.JSON(rsp)
+	})
+
+	app.Post("/sub/index", func(ctx *fiber.Ctx) error {
+		var req struct {
+			Url string `json:"url" yaml:"url"`
+		}
+
+		err = ctx.BodyParser(&req)
+		if err != nil {
+			log.Errorf("err:%v", err)
+			return err
+		}
+
+		if req.Url == "" {
+			return ctx.SendString("链接为空")
+		}
+
+		req.Url = base64.StdEncoding.EncodeToString([]byte(req.Url))
+
+		short := ShortMap{
+			Token:   utils.ShortStr(utils.Sha512(req.Url), 12),
+			JumpUrl: req.Url,
+		}
+		err = db.Where("token = ?", short.Token).FirstOrCreate(&short).Error
+		if err != nil {
+			log.Errorf("err:%v", err)
+			return err
+		}
+
+		return ctx.Render("short", fiber.Map{
+			"Title":    Title,
+			"ShortUrl": ctx.BaseURL() + "/" + short.Token,
+		})
 	})
 
 	err = app.Listen(viper.GetString("host"))
